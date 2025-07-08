@@ -17,17 +17,21 @@ use bevy::{
     prelude::GilrsPlugin,
 };
 
-use crate::plugins::core::input_event::{
+use crate::plugins::input::events::{
     KeyboardInput as GodotKeyboardInput, MouseButton as GodotMouseButton,
     MouseButtonInput as GodotMouseButtonInput, MouseMotion as GodotMouseMotion,
 };
 
 /// Plugin that bridges godot-bevy's input events to Bevy's standard input resources.
+/// This plugin automatically includes GodotInputEventPlugin as a dependency.
+#[derive(Default)]
 pub struct BevyInputBridgePlugin;
 
 impl Plugin for BevyInputBridgePlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(InputPlugin)
+        // Add the dependency - we need Godot input events to bridge them
+        app.add_plugins(super::events::GodotInputEventPlugin)
+            .add_plugins(InputPlugin)
             .add_plugins(GilrsPlugin)
             .add_systems(
                 PreUpdate,
@@ -80,7 +84,7 @@ fn bridge_mouse_button_input(
         };
 
         // Send MouseButtonInput event that Bevy's mouse_button_input_system will process
-        bevy_mouse_button_events.send(BevyMouseButtonInput {
+        bevy_mouse_button_events.write(BevyMouseButtonInput {
             button: bevy_button,
             state,
             window: Entity::PLACEHOLDER,
@@ -99,7 +103,7 @@ fn bridge_mouse_motion(
     // Send individual Bevy MouseMotion events AND accumulate for the frame
     for event in mouse_motion_events.read() {
         // Send individual MouseMotion event (for libraries that prefer events)
-        bevy_mouse_motion_events.send(BevyMouseMotion { delta: event.delta });
+        bevy_mouse_motion_events.write(BevyMouseMotion { delta: event.delta });
 
         // Accumulate delta for the AccumulatedMouseMotion resource
         accumulated_motion.delta += event.delta;

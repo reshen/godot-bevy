@@ -1,11 +1,11 @@
 //! Main audio plugin and systems
-use crate::bridge::GodotNodeHandle;
+use crate::interop::GodotNodeHandle;
 use crate::plugins::assets::GodotResource;
 use crate::plugins::audio::{
     ActiveTween, AudioChannel, AudioChannelMarker, AudioCommand, AudioOutput, AudioPlayerType,
     AudioSettings, ChannelId, ChannelState, MainAudioTrack, PlayCommand, SoundId, TweenType,
 };
-use crate::plugins::core::SceneTreeRef;
+use crate::plugins::scene_tree::SceneTreeRef;
 use crate::prelude::main_thread_system;
 use bevy::app::{App, Plugin, Update};
 use bevy::asset::Assets;
@@ -18,6 +18,7 @@ use thiserror::Error;
 
 /// Plugin that provides a comprehensive audio API using Godot's audio system.
 /// Supports 2D, 3D, and non-positional audio with channels, tweening, and spatial features.
+#[derive(Default)]
 pub struct GodotAudioPlugin;
 
 impl Plugin for GodotAudioPlugin {

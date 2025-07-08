@@ -1,10 +1,13 @@
-use super::collisions::ALL_COLLISION_SIGNALS;
-use super::node_markers::*;
-use super::{GodotTransformConfig, TransformSyncMode};
+use crate::interop::node_markers::*;
+use crate::plugins::transforms::IntoBevyTransform;
 use crate::prelude::main_thread_system;
-use crate::prelude::{Transform2D, Transform3D};
-use crate::{bridge::GodotNodeHandle, prelude::Collisions};
-use bevy::ecs::system::Res;
+use crate::{
+    interop::GodotNodeHandle,
+    plugins::collisions::{
+        AREA_ENTERED, AREA_EXITED, BODY_ENTERED, BODY_EXITED, COLLISION_START_SIGNALS,
+        CollisionEventType, Collisions,
+    },
+};
 use bevy::{
     app::{App, First, Plugin, PreStartup},
     ecs::{
@@ -13,9 +16,10 @@ use bevy::{
         event::{Event, EventReader, EventWriter, event_update_system},
         name::Name,
         schedule::IntoScheduleConfigs,
-        system::{Commands, NonSendMut, Query, SystemParam},
+        system::{Commands, NonSendMut, Query, Res, SystemParam},
     },
     log::{debug, trace},
+    prelude::Resource,
 };
 use godot::{
     builtin::GString,
@@ -35,15 +39,69 @@ use godot::{
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-pub struct GodotSceneTreePlugin;
+/// Unified scene tree plugin that provides:
+/// - SceneTreeRef for accessing the Godot scene tree
+/// - Scene tree events (NodeAdded, NodeRemoved, NodeRenamed)
+/// - Automatic entity creation and mirroring for scene tree nodes
+///
+/// This plugin is always included in the core plugins and provides
+/// complete scene tree integration out of the box.
+pub struct GodotSceneTreePlugin {
+    /// When true, add a Transform component to the scene's entity.
+    /// NOTE: this will not override a Transform if you've already attached one
+    pub add_transforms: bool,
+    /// When true, adds a parent child entity relationship in ECS
+    /// that mimics Godot's parent child node relationship.
+    /// NOTE: You should disable this if you want to use Avian Physics,
+    /// as it is incompatible, i.e., Avian Physics has its own notions
+    /// for what parent/child entity relatonships mean
+    pub add_child_relationship: bool,
+}
+
+impl Default for GodotSceneTreePlugin {
+    fn default() -> Self {
+        Self {
+            add_transforms: true,
+            add_child_relationship: true,
+        }
+    }
+}
+
+/// Configuration resource for scene tree behavior
+#[derive(Resource)]
+pub struct SceneTreeConfig {
+    /// Add a Transform component
+    pub add_transforms: bool,
+    /// When true, adds a parent child entity relationship in ECS
+    /// that mimics Godot's parent child node relationship.
+    /// NOTE: You should disable this if you want to use Avian Physics,
+    /// as it is incompatible, i.e., Avian Physics has its own notions
+    /// for what parent/child entity relatonships mean
+    pub add_child_relationship: bool,
+}
 
 impl Plugin for GodotSceneTreePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PreStartup, (initialize_scene_tree, connect_scene_tree))
-            .add_systems(First, write_scene_tree_events.before(event_update_system))
-            .add_systems(First, read_scene_tree_events.before(event_update_system))
+        // Auto-register all discovered AutoSyncBundle plugins
+        super::autosync::register_all_autosync_bundles(app);
+
+        app.init_non_send_resource::<SceneTreeRefImpl>()
+            .insert_resource(SceneTreeConfig {
+                add_transforms: self.add_transforms,
+                add_child_relationship: self.add_child_relationship,
+            })
             .add_event::<SceneTreeEvent>()
-            .init_non_send_resource::<SceneTreeRefImpl>();
+            .add_systems(
+                PreStartup,
+                (connect_scene_tree, initialize_scene_tree).chain(),
+            )
+            .add_systems(
+                First,
+                (
+                    write_scene_tree_events.before(event_update_system),
+                    read_scene_tree_events.before(event_update_system),
+                ),
+            );
     }
 }
 
@@ -79,12 +137,11 @@ impl Default for SceneTreeRefImpl {
 }
 
 #[main_thread_system]
-pub fn initialize_scene_tree(
+fn initialize_scene_tree(
     mut commands: Commands,
     mut scene_tree: SceneTreeRef,
     mut entities: Query<(&mut GodotNodeHandle, Entity)>,
-    config: Res<GodotTransformConfig>,
-    signal_sender: NonSendMut<super::signals::GodotSignalSender>,
+    config: Res<SceneTreeConfig>,
 ) {
     fn traverse(node: Gd<Node>, events: &mut Vec<SceneTreeEvent>) {
         events.push(SceneTreeEvent {
@@ -107,7 +164,6 @@ pub fn initialize_scene_tree(
         &mut scene_tree,
         &mut entities,
         &config,
-        &signal_sender.0,
     );
 }
 
@@ -355,14 +411,18 @@ fn create_scene_tree_entity(
     events: impl IntoIterator<Item = SceneTreeEvent>,
     scene_tree: &mut SceneTreeRef,
     entities: &mut Query<(&mut GodotNodeHandle, Entity)>,
-    config: &GodotTransformConfig,
-    signal_sender: &std::sync::mpsc::Sender<super::signals::GodotSignal>,
+    config: &SceneTreeConfig,
 ) {
     let mut ent_mapping = entities
         .iter()
         .map(|(reference, ent)| (reference.instance_id(), ent))
         .collect::<HashMap<_, _>>();
     let scene_root = scene_tree.get().get_root().unwrap();
+    let collision_watcher = scene_tree
+        .get()
+        .get_root()
+        .unwrap()
+        .get_node_as::<Node>("/root/BevyAppSingleton/CollisionWatcher");
 
     for event in events.into_iter() {
         trace!(target: "godot_scene_tree_events", event = ?event);
@@ -389,43 +449,71 @@ fn create_scene_tree_entity(
                 // Add node type marker components
                 add_node_type_markers(&mut ent, &mut node);
 
-                // Only add transform components if sync mode is not disabled
-                if config.sync_mode != TransformSyncMode::Disabled {
+                // Add transform components if configured to do so
+                if config.add_transforms {
                     if let Some(node3d) = node.try_get::<Node3D>() {
-                        ent.insert(Transform3D::from(node3d.get_transform()));
-                    }
-
-                    if let Some(node2d) = node.try_get::<Node2D>() {
-                        let transform = node2d.get_transform();
-                        ent.insert(Transform2D::from(transform));
+                        ent.insert_if_new(node3d.get_transform().to_bevy_transform());
+                    } else if let Some(node2d) = node.try_get::<Node2D>() {
+                        ent.insert_if_new(node2d.get_transform().to_bevy_transform());
                     }
                 }
 
-                let node = node.get::<Node>();
+                let mut node = node.get::<Node>();
 
-                // Check for any collision-related signals and connect them
-                let has_collision_signals = ALL_COLLISION_SIGNALS
+                // Check if the node is a collision body (Area2D, Area3D, RigidBody2D, RigidBody3D, etc.)
+                // These nodes typically have collision detection capabilities
+                let is_collision_body = COLLISION_START_SIGNALS
                     .iter()
                     .any(|&signal| node.has_signal(signal));
 
-                if has_collision_signals {
+                if is_collision_body {
                     debug!(target: "godot_scene_tree_collisions",
                            node_id = node.instance_id().to_string(),
-                           "has collision signals");
+                           "is collision body");
 
-                    // Connect all available collision signals using the universal handler
-                    for &signal_name in ALL_COLLISION_SIGNALS {
-                        if node.has_signal(signal_name) {
-                            let mut node_handle =
-                                GodotNodeHandle::from_instance_id(node.instance_id());
-                            super::signals::connect_godot_signal(
-                                &mut node_handle,
-                                signal_name,
-                                signal_sender.clone(),
-                            );
-                        }
+                    let node_clone = node.clone();
+
+                    if node.has_signal(BODY_ENTERED) {
+                        node.connect(
+                            BODY_ENTERED,
+                            &collision_watcher.callable("collision_event").bind(&[
+                                node_clone.to_variant(),
+                                CollisionEventType::Started.to_variant(),
+                            ]),
+                        );
                     }
 
+                    if node.has_signal(BODY_EXITED) {
+                        node.connect(
+                            BODY_EXITED,
+                            &collision_watcher.callable("collision_event").bind(&[
+                                node_clone.to_variant(),
+                                CollisionEventType::Ended.to_variant(),
+                            ]),
+                        );
+                    }
+
+                    if node.has_signal(AREA_ENTERED) {
+                        node.connect(
+                            AREA_ENTERED,
+                            &collision_watcher.callable("collision_event").bind(&[
+                                node_clone.to_variant(),
+                                CollisionEventType::Started.to_variant(),
+                            ]),
+                        );
+                    }
+
+                    if node.has_signal(AREA_EXITED) {
+                        node.connect(
+                            AREA_EXITED,
+                            &collision_watcher.callable("collision_event").bind(&[
+                                node_clone.to_variant(),
+                                CollisionEventType::Ended.to_variant(),
+                            ]),
+                        );
+                    }
+
+                    // Add Collisions component to track collision state
                     ent.insert(Collisions::default());
                 }
 
@@ -435,17 +523,17 @@ fn create_scene_tree_entity(
                 ent_mapping.insert(node.instance_id(), ent);
 
                 // Try to add any registered bundles for this node type
-                crate::autosync::try_add_bundles_for_node(commands, ent, &event.node);
+                super::autosync::try_add_bundles_for_node(commands, ent, &event.node);
 
-                if node.instance_id() != scene_root.instance_id() {
+                if config.add_child_relationship && node.instance_id() != scene_root.instance_id() {
                     if let Some(parent) = node.get_parent() {
                         let parent_id = parent.instance_id();
                         if let Some(&parent_entity) = ent_mapping.get(&parent_id) {
                             commands.entity(parent_entity).add_children(&[ent]);
                         } else {
-                            bevy::log::warn!(target: "godot_scene_tree_events", 
-                                "Parent entity with ID {} not found in ent_mapping. This might indicate a missing or incorrect mapping.", 
-                                parent_id);
+                            bevy::log::warn!(target: "godot_scene_tree_events",
+                            "Parent entity with ID {} not found in ent_mapping. This might indicate a missing or incorrect mapping.",
+                            parent_id);
                         }
                     }
                 }
@@ -477,8 +565,7 @@ fn read_scene_tree_events(
     mut scene_tree: SceneTreeRef,
     mut event_reader: EventReader<SceneTreeEvent>,
     mut entities: Query<(&mut GodotNodeHandle, Entity)>,
-    config: Res<GodotTransformConfig>,
-    signal_sender: NonSendMut<super::signals::GodotSignalSender>,
+    config: Res<SceneTreeConfig>,
 ) {
     create_scene_tree_entity(
         &mut commands,
@@ -486,6 +573,5 @@ fn read_scene_tree_events(
         &mut scene_tree,
         &mut entities,
         &config,
-        &signal_sender.0,
     );
 }
